@@ -1,90 +1,91 @@
-"""Arduino turntable controller helper.
-
-Provides a thin wrapper around pyserial for common operations and a
-local simulator when serial isn't available. The interface is intentionally
-small: connect(), disconnect(), rotate_degrees(), step(), home().
-"""
-from __future__ import annotations
-
-import logging
+import serial
 import time
-from typing import Optional
+import serial.tools.list_ports
+import platform
 
+#Variables
+pos = 0
+#Arduino Port detection
+def find_arduino():
+    """Find Arduino automatically"""
+    for port in serial.tools.list_ports.comports():
+        if 'Arduino' in port.description or 'CH340' in port.description or 'ttyUSB' in port.description:
+            return port.device
+    return None
+
+
+
+if platform.system() == "Windows":
+    port = find_arduino()        # typical on Windows
+else:
+    port = "/dev/ttyUSB0"  # typical on Linux
+
+
+if port:
+    print(f"Found Arduino on {port}")
+else:
+    print("Arduino not found")
+
+
+ser = serial.Serial(port, baudrate = 9600, timeout=1)
+time.sleep(2)
+
+#check if arduino sent something
+def recieve_Message():
+        if ser.in_waiting > 0:
+                        arduino_message = ser.readline().decode('utf-8', errors='ignore').strip()
+                        if arduino_message:
+                                print(f"Arduino: {arduino_message}")
+                                time.sleep(0.1)
+#get user input and send Message
+def send_Message(message):
+    ser.write((str(message) + '\n').encode('utf-8'))
+    time.sleep(0.1)
+    return True
+
+#Andreis methods
+def goback(x=1):
+    global pos
+    target = pos - (x * 20)  # move back by x * 20 degrees
+    if target < 0:
+        target = 0  # limit to minimum position
+    for angle in range(pos, target - 1, -20):  # smooth steps backward
+        pos = angle
+        send_Message(pos)
+        time.sleep(0.05)
+def goforward(x=1):
+    global pos
+    target = pos + (x * 20)  # move forward by 20 degrees
+    if target > 180:
+        target = 180  # limit to max position
+    for angle in range(pos, target + 1, 20):  # smooth steps of 2 degrees
+        pos = angle
+        send_Message(pos)
+        time.sleep(0.05)  # adjust delay for speed
+def turnZero():
+    global pos
+    for angle in range(pos, -1, -10):  # go from current pos down to 0 in steps of -10
+        pos = angle
+        send_Message(pos)
+        time.sleep(0.1)
+def turnMaximum():
+    global pos
+    for angle in range(pos, 181, 10):  # go from current pos to 180 in steps of 10
+        pos = angle
+        send_Message(pos)
+        time.sleep(0.1) 
+        
 try:
-    import serial
-except Exception:  # pragma: no cover - serial may not be installed in CI
-    serial = None  # type: ignore
+    goforward()
+    time.sleep(1)
+    goforward()
+    time.sleep(1)
+    goback()
+    time.sleep(1)
+    goback()
 
-
-LOG = logging.getLogger(__name__)
-
-
-class ArduinoController:
-    def __init__(self, port: Optional[str] = None, baud: int = 115200, step_delay: float = 0.3) -> None:
-        self.port = port
-        self.baud = baud
-        self.step_delay = step_delay
-        self._ser = None
-        self._simulated = serial is None or port is None
-
-    def connect(self) -> bool:
-        if self._simulated:
-            LOG.info("ArduinoController: running in simulated mode")
-            return True
-        try:
-            self._ser = serial.Serial(self.port, self.baud, timeout=2)
-            time.sleep(2)
-            LOG.info("Connected to Arduino on %s", self.port)
-            return True
-        except Exception as exc:
-            LOG.exception("Failed to open serial port %s: %s", self.port, exc)
-            self._ser = None
-            self._simulated = True
-            return False
-
-    def disconnect(self) -> None:
-        if self._ser:
-            try:
-                self._ser.close()
-            except Exception:
-                LOG.exception("Error while closing serial")
-            self._ser = None
-
-    def _write(self, data: str) -> None:
-        if self._simulated:
-            LOG.debug("[SIM] Write to Arduino: %s", data)
-            return
-        if not self._ser:
-            raise RuntimeError("Arduino not connected")
-        self._ser.write(data.encode("utf-8") + b"\n")
-
-    def rotate_degrees(self, degrees: float) -> None:
-        """Rotate the turntable by degrees (positive clockwise).
-
-        The serial protocol is intentionally simple: send a line like
-        "ROTATE 10" to rotate 10 degrees. The Arduino firmware should
-        accept and handle that command. If no hardware is present, we
-        simply log and sleep a short amount to simulate motion.
-        """
-        cmd = f"ROTATE {degrees}"
-        try:
-            self._write(cmd)
-        except Exception:
-            LOG.exception("Failed to send rotate command")
-        # small delay to let physical turntable move; adjustable via step_delay
-        time.sleep(self.step_delay)
-
-    def step(self, steps: int = 1, degrees_per_step: float = 10.0) -> None:
-        self.rotate_degrees(steps * degrees_per_step)
-
-    def home(self) -> None:
-        """Return turntable to home position. Protocol: send HOME."""
-        try:
-            self._write("HOME")
-        except Exception:
-            LOG.exception("Failed to send home command")
-        time.sleep(self.step_delay)
-
-
-def make_controller(port: Optional[str] = None, baud: int = 115200) -> ArduinoController:
-    return ArduinoController(port=port, baud=baud)
+except KeyboardInterrupt:
+        print("\nProgramm stopped by user.")
+finally:
+        ser.close()
+        print("Serial closed.")

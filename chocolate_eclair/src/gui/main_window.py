@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+import cv2
+
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -16,6 +22,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QComboBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -32,11 +39,37 @@ from chocolate_eclair.src.core.meshroom_runner import (
 )
 
 from ..core.capture import capture_and_analyze
-from ..hardware.arduino_controller import make_controller
+from ..hardware.turntable_controller import TurntableController, TurntableError
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".dng"}
 WORKSPACE_DIR = Path(__file__).resolve().parents[4] / "workspace"
+
+
+def _preferred_camera_backend() -> int:
+    if sys.platform.startswith("win"):
+        return getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
+    if sys.platform.startswith("linux"):
+        return getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)
+    if sys.platform == "darwin":
+        return getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY)
+    return cv2.CAP_ANY
+
+
+def _try_open_camera(index: int, backend: Optional[int]) -> Optional[cv2.VideoCapture]:
+    try:
+        if backend is None or backend == cv2.CAP_ANY:
+            cap = cv2.VideoCapture(index)
+        else:
+            cap = cv2.VideoCapture(index, backend)
+    except Exception:
+        return None
+
+    if not cap or not cap.isOpened():
+        if cap:
+            cap.release()
+        return None
+    return cap
 
 
 class _AnalysisSignals(QObject):
@@ -136,6 +169,143 @@ class DropListWidget(QListWidget):
         event.acceptProposedAction()
 
 
+class CameraSelectionDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget,
+        cameras: List[tuple[int, str]],
+        current_index: Optional[int],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select Camera")
+        self.setModal(True)
+        self._cameras = cameras
+        self.selected_camera_index: Optional[int] = current_index
+        self._capture: Optional[cv2.VideoCapture] = None
+
+        layout = QVBoxLayout()
+
+        self.selector = QComboBox()
+        for index, label in cameras:
+            self.selector.addItem(label, index)
+        if current_index is not None:
+            combo_index = self.selector.findData(current_index)
+            if combo_index >= 0:
+                self.selector.setCurrentIndex(combo_index)
+        self.selector.currentIndexChanged.connect(self._on_camera_changed)
+        layout.addWidget(self.selector)
+
+        inputs_text = "\n".join(f"{idx}: {label}" for idx, label in cameras) or "No inputs detected."
+        self.inputs_label = QLabel(f"Detected inputs:\n{inputs_text}")
+        self.inputs_label.setAlignment(Qt.AlignLeft)
+        layout.addWidget(self.inputs_label)
+
+        self.preview_label = QLabel("Preview not available")
+        self.preview_label.setFixedSize(360, 270)
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.preview_label)
+
+        self.info_label = QLabel("")
+        layout.addWidget(self.info_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.setLayout(layout)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._update_preview)
+
+        if cameras:
+            initial_index = self.selector.currentData()
+            if initial_index is None:
+                initial_index = cameras[0][0]
+            self._start_preview(int(initial_index))
+
+    def _start_preview(self, index: int) -> None:
+        self._stop_preview()
+
+        cap = self._open_capture(index)
+        if not cap or not cap.isOpened():
+            self.preview_label.setText("Unable to open camera preview")
+            self.info_label.setText("")
+            return
+
+        self._capture = cap
+        self.selected_camera_index = index
+        self.preview_label.setText("Starting preview...")
+        self._timer.start(1000 // 24)
+
+    def _stop_preview(self, close_capture: bool = True) -> None:
+        self._timer.stop()
+        if close_capture and self._capture is not None:
+            try:
+                self._capture.release()
+            except Exception:
+                pass
+            self._capture = None
+
+    def _update_preview(self) -> None:
+        if not self._capture:
+            return
+        ret, frame = self._capture.read()
+        if not ret or frame is None:
+            return
+
+        height, width = frame.shape[:2]
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = QImage(
+            frame_rgb.data,
+            width,
+            height,
+            frame_rgb.strides[0],
+            QImage.Format_RGB888,
+        ).copy()
+        pixmap = QPixmap.fromImage(image).scaled(
+            self.preview_label.width(),
+            self.preview_label.height(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(pixmap)
+        self.info_label.setText(f"Resolution: {width}x{height}")
+
+    def _on_camera_changed(self, combo_index: int) -> None:
+        index_data = self.selector.itemData(combo_index)
+        if index_data is None:
+            return
+        self._start_preview(int(index_data))
+
+    def _on_accept(self) -> None:
+        if self.selector.count() == 0:
+            QMessageBox.warning(self, "No cameras", "No cameras available to select.")
+            return
+        index_data = self.selector.currentData()
+        if index_data is None:
+            QMessageBox.warning(self, "Selection error", "Unable to determine selected camera.")
+            return
+        self.selected_camera_index = int(index_data)
+        self._stop_preview(close_capture=True)
+        self.accept()
+
+    def reject(self) -> None:  # type: ignore[override]
+        self._stop_preview(close_capture=True)
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._stop_preview(close_capture=True)
+        super().closeEvent(event)
+
+    @staticmethod
+    def _open_capture(index: int) -> Optional[cv2.VideoCapture]:
+        backend = _preferred_camera_backend()
+        cap = _try_open_camera(index, backend)
+        if not cap and backend != cv2.CAP_ANY:
+            cap = _try_open_camera(index, cv2.CAP_ANY)
+        return cap
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -172,9 +342,19 @@ class MainWindow(QMainWindow):
         self.connect_turntable_btn.toggled.connect(self._toggle_arduino_connection)
         button_bar.addWidget(self.connect_turntable_btn)
 
-        capture_btn = QPushButton("Capture Sequence")
-        capture_btn.clicked.connect(self._capture_sequence)
-        button_bar.addWidget(capture_btn)
+        self.capture_sequence_btn = QPushButton("Capture Sequence")
+        self.capture_sequence_btn.clicked.connect(self._capture_sequence)
+        self.capture_sequence_btn.setEnabled(False)
+        button_bar.addWidget(self.capture_sequence_btn)
+
+        self.select_camera_btn = QPushButton("Select Camera")
+        self.select_camera_btn.clicked.connect(self._select_camera)
+        button_bar.addWidget(self.select_camera_btn)
+
+        self.capture_photo_btn = QPushButton("Capture Photo")
+        self.capture_photo_btn.clicked.connect(self._capture_photo)
+        self.capture_photo_btn.setEnabled(False)
+        button_bar.addWidget(self.capture_photo_btn)
 
         clear_btn = QPushButton("Clear List")
         clear_btn.clicked.connect(self.drop_list.clear)
@@ -206,10 +386,13 @@ class MainWindow(QMainWindow):
         WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
         logging.basicConfig(level=logging.INFO)
 
-        try:
-            self.arduino = make_controller()
-        except Exception:
-            self.arduino = None
+        self.turntable = None  # type: Optional[TurntableController]
+        self.camera_index = None  # type: Optional[int]
+        self.capture_project_dir = None  # type: Optional[Path]
+        self.capture_step_degrees = 20.0
+        self.camera_capture = None  # type: Optional[cv2.VideoCapture]
+        self.available_cameras = []  # type: List[tuple[int, str]]
+        self._refresh_turntable_availability()
 
         base_dir = Path(__file__).resolve().parents[3]
         self.meshroom_executable = detect_default_meshroom_executable(base_dir)
@@ -271,30 +454,229 @@ class MainWindow(QMainWindow):
         self.toggle_log_btn.setText("Show Log" if hidden else "Hide Log")
 
     def _toggle_arduino_connection(self, checked: bool) -> None:
+        controller = self.turntable
+        if not controller:
+            self._log("Turntable controller unavailable.")
+            self._update_turntable_ui("Arduino not detected. Manual capture only.")
+            return
+
         if checked:
             self._log("Connecting to turntable...")
-            if self.arduino and self.arduino.connect():
-                self.connect_turntable_btn.setText("Disconnect Turntable")
-                self._log("Turntable connected (or simulated).")
-            else:
-                self._log("Failed to connect to turntable; running simulated controller.")
-                self.connect_turntable_btn.setChecked(True)
-                self.connect_turntable_btn.setText("Disconnect Turntable")
+            if not controller.is_available and not controller.refresh_port():
+                self._log("No Arduino turntable detected.")
+                QMessageBox.warning(
+                    self,
+                    "No Arduino detected",
+                    "Unable to detect an Arduino turntable. Connect it and try again.",
+                )
+                self._update_turntable_ui("Arduino not detected. Manual capture only.")
+                return
+
+            try:
+                controller.connect()
+            except TurntableError as exc:
+                self._log(f"Turntable connection failed: {exc}")
+                QMessageBox.warning(
+                    self,
+                    "Turntable error",
+                    f"Failed to connect to the Arduino turntable.\n{exc}",
+                )
+                self._update_turntable_ui("Arduino not detected. Manual capture only.")
+                return
+
+            self._log("Turntable connected.")
+            self._update_turntable_ui("Turntable connected. Ready for capture sequence.")
         else:
             self._log("Disconnecting turntable...")
-            if self.arduino:
+            try:
+                controller.disconnect()
+            except Exception:
+                pass
+            self._update_turntable_ui("Turntable disconnected.")
+
+    def _refresh_turntable_availability(self) -> None:
+        try:
+            controller = TurntableController()
+        except TurntableError as exc:
+            self.turntable = None
+            self._log(f"Turntable controller not available: {exc}")
+            self._update_turntable_ui("Arduino not detected. Manual capture only.")
+            return
+
+        self.turntable = controller
+        if controller.is_available:
+            self._log("Arduino turntable detected. Use 'Connect Turntable' to enable rotation.")
+            self._update_turntable_ui()
+        else:
+            self._log("No Arduino turntable detected.")
+            self._update_turntable_ui("Arduino not detected. Manual capture only.")
+
+    def _update_turntable_ui(self, status_message: Optional[str] = None) -> None:
+        controller = self.turntable
+        if controller and controller.is_connected:
+            text = "Disconnect Turntable"
+            capture_enabled = True
+            checked = True
+            enabled = True
+        elif controller and controller.is_available:
+            text = "Connect Turntable"
+            capture_enabled = False
+            checked = False
+            enabled = True
+        else:
+            text = "Arduino Not Detected"
+            capture_enabled = False
+            checked = False
+            enabled = False
+
+        self.connect_turntable_btn.blockSignals(True)
+        self.connect_turntable_btn.setChecked(checked)
+        self.connect_turntable_btn.blockSignals(False)
+        self.connect_turntable_btn.setEnabled(enabled)
+        self.connect_turntable_btn.setText(text)
+        self.capture_sequence_btn.setEnabled(capture_enabled)
+
+        if status_message:
+            self.status_label.setText(status_message)
+
+    def _ensure_capture_project_dir(self) -> Path:
+        if self.capture_project_dir and self.capture_project_dir.exists():
+            return self.capture_project_dir
+
+        project_dir = WORKSPACE_DIR / self._suggest_project_name()
+        input_dir = project_dir / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        self.capture_project_dir = project_dir
+        self._log(f"Capture project folder prepared: {project_dir}")
+        return project_dir
+
+    def _scan_available_cameras(self, max_index: int = 6) -> List[tuple[int, str]]:
+        cameras: List[tuple[int, str]] = []
+        for index in range(max_index):
+            cap = self._open_camera_capture(index)
+            if not cap:
+                continue
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            label = f"Camera {index}"
+            if width and height:
+                label = f"{label} ({width}x{height})"
+            cameras.append((index, label))
+            cap.release()
+
+        self.available_cameras = cameras
+        return cameras
+
+    @staticmethod
+    def _open_camera_capture(index: int) -> Optional[cv2.VideoCapture]:
+        backend = _preferred_camera_backend()
+        cap = _try_open_camera(index, backend)
+        if not cap and backend != cv2.CAP_ANY:
+            cap = _try_open_camera(index, cv2.CAP_ANY)
+        return cap
+
+    def _select_camera(self) -> bool:
+        cameras = self._scan_available_cameras()
+        if not cameras:
+            QMessageBox.warning(self, "No cameras", "No webcams detected. Connect one and try again.")
+            return False
+
+        dialog = CameraSelectionDialog(self, cameras, self.camera_index)
+        result = dialog.exec_()
+        selected_idx = dialog.selected_camera_index if dialog.selected_camera_index is not None else None
+
+        if result != QDialog.Accepted or selected_idx is None:
+            return False
+
+        capture = self._open_camera_capture(selected_idx)
+        if not capture:
+            QMessageBox.warning(self, "Camera error", "Unable to open the selected camera.")
+            return False
+
+        if self.camera_capture and self.camera_capture.isOpened():
+            try:
+                self.camera_capture.release()
+            except Exception:
+                pass
+
+        self.camera_capture = capture
+        self.camera_index = selected_idx
+        self.capture_photo_btn.setEnabled(True)
+
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        res_text = f" ({width}x{height})" if width and height else ""
+        self.status_label.setText(f"Camera {selected_idx}{res_text} selected. Ready to capture.")
+        self._log(f"Camera index set to {selected_idx}{res_text}")
+        return True
+
+    def _capture_photo(self) -> None:
+        if self.camera_index is None and not self._select_camera():
+            return
+
+        if self.camera_capture is None or not self.camera_capture.isOpened():
+            if self.camera_capture:
                 try:
-                    self.arduino.disconnect()
+                    self.camera_capture.release()
                 except Exception:
                     pass
-            self.connect_turntable_btn.setText("Connect Turntable")
+            self.camera_capture = self._open_camera_capture(int(self.camera_index)) if self.camera_index is not None else None
+            if self.camera_capture is None or not self.camera_capture.isOpened():
+                QMessageBox.warning(self, "Camera error", "Unable to access the selected camera.")
+                return
+
+        project_dir = self._ensure_capture_project_dir()
+        save_dir = project_dir / "input"
+        filename = datetime.now().strftime("capture_%Y%m%d_%H%M%S_%f.jpg")
+        save_path = save_dir / filename
+
+        controller = self.turntable if (self.turntable and self.turntable.is_connected) else None
+        advance = self.capture_step_degrees if controller else 0.0
+
+        try:
+            info = capture_and_analyze(
+                save_path,
+                camera_index=int(self.camera_index),
+                arduino=controller,
+                advance_degrees=advance,
+                capture=self.camera_capture,
+            )
+        except Exception as exc:  # pragma: no cover - hardware dependent
+            logging.exception("Manual capture failed")
+            QMessageBox.critical(self, "Capture failed", str(exc))
+            self._log(f"Capture failed: {exc}")
+            return
+
+        metrics = info.get("metrics", {})
+        path = info.get("path")
+        ok = info.get("ok", False)
+
+        if ok and path:
+            blur_val = float(metrics.get("blur", 0.0))
+            brightness_val = float(metrics.get("brightness", 0.0))
+            self._enqueue_files([str(path)])
+            self._log(
+                f"Captured photo {path} — blur {blur_val:.2f} brightness {brightness_val:.2f}"
+            )
+            self.status_label.setText("Photo captured and queued for analysis.")
+        else:
+            issues = metrics.get("issues", []) if isinstance(metrics, dict) else []
+            issue_text = "\n".join(str(issue) for issue in issues) or "Please retake the photo."
+            QMessageBox.warning(self, "Photo needs attention", issue_text)
+            self._log(f"Photo requires attention: {issue_text}")
 
     def _capture_sequence(self) -> None:
-        if not self.arduino:
-            try:
-                self.arduino = make_controller()
-            except Exception:
-                self.arduino = None
+        if not self.turntable or not self.turntable.is_connected:
+            QMessageBox.warning(
+                self,
+                "Turntable not connected",
+                "Connect the Arduino turntable before starting the capture sequence.",
+            )
+            self._update_turntable_ui()
+            return
+
+        if self.camera_index is None and not self._select_camera():
+            return
 
         count, ok = QInputDialog.getInt(
             self,
@@ -326,8 +708,10 @@ class MainWindow(QMainWindow):
             save_dir=input_dir,
             count=count,
             step_deg=float(step_deg),
-            arduino=self.arduino,
+            camera_index=int(self.camera_index) if self.camera_index is not None else 0,
+            arduino=self.turntable,
         )
+        self.capture_step_degrees = float(step_deg)
         worker.signals.finished.connect(self._on_capture_finished)
         self.thread_pool.start(worker)
         self._log(
@@ -638,3 +1022,12 @@ class MainWindow(QMainWindow):
         if staged_input:
             self._log(f"Input folder available at {staged_input}.")
         self.status_label.setText("Meshroom processing finished with errors.")
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.camera_capture and self.camera_capture.isOpened():
+            try:
+                self.camera_capture.release()
+            except Exception:
+                pass
+        self.camera_capture = None
+        super().closeEvent(event)

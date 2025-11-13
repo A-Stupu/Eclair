@@ -7,6 +7,7 @@ from a background thread.
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -17,19 +18,54 @@ from chocolate_eclair.src.core.photo_checker import analyze_photo
 LOG = logging.getLogger(__name__)
 
 
+def _preferred_backend() -> int:
+    if sys.platform.startswith("win"):
+        return getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
+    if sys.platform.startswith("linux"):
+        return getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)
+    if sys.platform == "darwin":
+        return getattr(cv2, "CAP_AVFOUNDATION", cv2.CAP_ANY)
+    return cv2.CAP_ANY
+
+
+def _open_with_backend(index: int, backend: int) -> Optional[cv2.VideoCapture]:
+    try:
+        cap = cv2.VideoCapture(index, backend)
+    except Exception:
+        return None
+    if not cap or not cap.isOpened():
+        if cap:
+            cap.release()
+        return None
+    return cap
+
+
 def _open_camera(index: int = 0) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
+    backend = _preferred_backend()
+    cap = _open_with_backend(index, backend)
+    if not cap and backend != cv2.CAP_ANY:
+        cap = _open_with_backend(index, cv2.CAP_ANY)
+    if not cap:
         raise RuntimeError(f"Unable to open camera index {index}")
     return cap
 
 
-def capture_image(save_path: Path, camera_index: int = 0) -> Path:
+def capture_image(
+    save_path: Path,
+    camera_index: int = 0,
+    capture: Optional[cv2.VideoCapture] = None,
+) -> Path:
     """Capture a single frame from the camera and write to save_path.
 
     Returns the path to the saved file.
     """
-    cap = _open_camera(camera_index)
+    if capture is None:
+        cap = _open_camera(camera_index)
+        release_needed = True
+    else:
+        cap = capture
+        release_needed = False
+
     try:
         ret, frame = cap.read()
         if not ret or frame is None:
@@ -39,7 +75,8 @@ def capture_image(save_path: Path, camera_index: int = 0) -> Path:
         LOG.info("Captured image: %s", save_path)
         return save_path
     finally:
-        cap.release()
+        if release_needed:
+            cap.release()
 
 
 def capture_and_analyze(
@@ -47,6 +84,7 @@ def capture_and_analyze(
     camera_index: int = 0,
     arduino=None,
     advance_degrees: float = 10.0,
+    capture: Optional[cv2.VideoCapture] = None,
 ) -> Dict[str, object]:
     """Capture an image, analyze it, and optionally advance the turntable.
 
@@ -58,7 +96,7 @@ def capture_and_analyze(
 
     Returns a dict with keys: path, metrics, ok (bool)
     """
-    path = capture_image(save_path, camera_index=camera_index)
+    path = capture_image(save_path, camera_index=camera_index, capture=capture)
     used_arduino = arduino is not None
 
     # move forward immediately after capture to prepare next position
