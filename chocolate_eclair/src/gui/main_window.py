@@ -35,6 +35,7 @@ from chocolate_eclair.src.core.meshroom_runner import (
     detect_default_meshroom_executable,
     get_pipeline_steps,
     has_cuda_support,
+    collect_sfm_outputs,
     run_meshroom_background,
 )
 
@@ -993,6 +994,21 @@ class MainWindow(QMainWindow):
         staged_input = getattr(process, "staged_input", None)
         if staged_input:
             self._log(f"Input folder available at {staged_input}.")
+
+        cache_dir = getattr(process, "cache_dir", None)
+        if cache_dir:
+            sfm_dir = output_path / "sfm"
+            try:
+                exported = collect_sfm_outputs(Path(cache_dir), sfm_dir)
+            except Exception as exc:  # pragma: no cover - defensive
+                exported = []
+                self._log(f"Unable to export Structure-from-Motion results: {exc}")
+            else:
+                if exported:
+                    names = ", ".join(p.name for p in exported)
+                    self._log(f"Structure-from-Motion outputs saved to {sfm_dir} ({names}).")
+                else:
+                    self._log("No Structure-from-Motion outputs were found to export.")
 
         ignore_names = {"input", "cache", "meshroom.log", "meshroomcache"}
         relevant_outputs = [

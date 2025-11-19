@@ -33,12 +33,20 @@ def detect_default_meshroom_executable(base_dir: Path | None = None) -> Path | N
         ]
         executables = ["meshroom_batch.exe", "meshroom_photogrammetry.exe", "Meshroom.exe"]
     else:
-        search_dirs = [
-            chocolate_root / "meshroom_linux",
-            chocolate_root,
-            root / "meshroom",
-        ]
         executables = ["meshroom_batch", "meshroom_photogrammetry", "Meshroom"]
+        search_dirs: list[Path] = []
+        candidate_roots = [
+            chocolate_root,
+            root,
+            *list(root.parents[:4]),
+        ]
+        for base in candidate_roots:
+            if not isinstance(base, Path):
+                continue
+            for suffix in ("meshroom_linux", "meshroom", ""):
+                directory = base / suffix if suffix else base
+                if directory not in search_dirs:
+                    search_dirs.append(directory)
 
     for directory in search_dirs:
         for exe in executables:
@@ -132,9 +140,9 @@ def get_pipeline_steps(cuda_enabled: Optional[bool] = None) -> List[str]:
         "ImageMatching",
         "FeatureMatching",
         "StructureFromMotion",
-        "Meshing",
-        "PrepareDenseScene",
-        "Texturing",
+    #   "Meshing",
+    #    "PrepareDenseScene",
+    #    "Texturing",
     ]
 
 
@@ -157,6 +165,41 @@ def _stage_images(image_paths: Iterable[Path | str], workspace_dir: Path) -> Pat
         shutil.copy2(src, destination)
 
     return staging_dir
+
+
+def collect_sfm_outputs(cache_dir: Path, destination_dir: Path) -> List[Path]:
+    """Copy Structure-from-Motion artifacts from cache to destination."""
+
+    collected: List[Path] = []
+    sfm_root = cache_dir / "StructureFromMotion"
+    if not sfm_root.exists() or not sfm_root.is_dir():
+        return collected
+
+    try:
+        node_dirs = sorted(
+            (p for p in sfm_root.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return collected
+
+    for node_dir in node_dirs:
+        copied_here = False
+        for name in ("sfm.abc", "cameras.sfm", "cameras.bin"):
+            source = node_dir / name
+            if not source.exists():
+                continue
+            if not destination_dir.exists():
+                destination_dir.mkdir(parents=True, exist_ok=True)
+            target = destination_dir / source.name
+            shutil.copy2(source, target)
+            collected.append(target)
+            copied_here = True
+        if copied_here:
+            break
+
+    return collected
 
 
 def run_meshroom_background(
@@ -293,5 +336,6 @@ def run_meshroom_background(
     setattr(process, "output_dir", project_dir)
     setattr(process, "staged_input", staged_input)
     setattr(process, "pipeline_cuda", cuda_enabled)
+    setattr(process, "cache_dir", cache_dir)
 
     return process
