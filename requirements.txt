@@ -1,5 +1,5 @@
 PyQt5
 opencv-python
-numpy
 Pillow
+numpy
 pyserial
