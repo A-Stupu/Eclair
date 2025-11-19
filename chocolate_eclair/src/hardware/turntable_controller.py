@@ -6,8 +6,10 @@ the hardware without modifying the legacy ``arduino_controller.py`` script.
 from __future__ import annotations
 
 import time
+import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, List, Optional
 
 try:  # pragma: no cover - optional dependency handling
     import serial  # type: ignore
@@ -20,6 +22,8 @@ else:
 
 __all__ = ["TurntableController", "TurntableError"]
 
+_PORT_KEYWORDS = ("arduino", "ch340", "ttyusb", "ttyacm", "cp210")
+
 
 class TurntableError(RuntimeError):
     """Raised when the turntable cannot be controlled."""
@@ -30,12 +34,15 @@ class TurntableController:
 	baudrate: int = 9600
 	step_size: float = 20.0
 	timeout: float = 1.0
+	port_hint: Optional[str] = None
 
 	_serial: Optional[Any] = None
 	_port: Optional[str] = None
 	_position: float = 0.0
+	_env_port: Optional[str] = None
 
 	def __post_init__(self) -> None:
+		self._env_port = os.getenv("ECLAIR_TURNTABLE_PORT")
 		self._ensure_support()
 		self.refresh_port()
 
@@ -90,11 +97,14 @@ class TurntableController:
 		target = self._position + degrees
 		target = max(0.0, min(180.0, target))
 
-		if self.step_size > 0:
-			target = round(target / self.step_size) * self.step_size
-			target = max(0.0, min(180.0, target))
+		# if self.step_size > 0:
+		# 	target = round(target / self.step_size) * self.step_size
+		# 	target = max(0.0, min(180.0, target))
 
-		command = f"{int(target)}\n".encode("ascii")
+		# command = f"{int(target)}\n".encode("ascii")
+		command = f"{int(target)}\n".encode("utf-8")
+		# command = (str(target) + '\n').encode('utf-8')
+  
 		try:
 			self._serial.write(command)
 			self._serial.flush()
@@ -110,12 +120,39 @@ class TurntableController:
 		if self._position:
 			self.rotate_degrees(-self._position)
 
+	def list_available_ports(self) -> List[str]:
+		return [port.device for port in serial.tools.list_ports.comports() if port.device]
+
 	def _find_port(self) -> Optional[str]:
-		for port in serial.tools.list_ports.comports():
+		ports = list(serial.tools.list_ports.comports())
+		preferred = self.port_hint or self._env_port
+		if preferred:
+			preferred = preferred.strip()
+			if preferred and self._port_is_present(preferred, ports):
+				return preferred
+			path = Path(preferred)
+			if path.exists():
+				return preferred
+
+		for port in ports:
 			description = (port.description or "").lower()
-			if any(key in description for key in ("arduino", "ch340", "ttyusb", "ttyacm")):
+			if any(key in description for key in _PORT_KEYWORDS):
 				return port.device
-		return None
+			device = (port.device or "").lower()
+			if any(key in device for key in _PORT_KEYWORDS):
+				return port.device
+
+		return ports[0].device if ports else None
+
+	@staticmethod
+	def _port_is_present(target: str, ports: List[Any]) -> bool:
+		target = target.strip()
+		for port in ports:
+			if not port.device:
+				continue
+			if port.device == target or port.name == target:
+				return True
+		return False
 
 	def __del__(self) -> None:  # pragma: no cover - defensive cleanup
 		try:

@@ -96,24 +96,37 @@ class _CaptureSignals(QObject):
     finished = pyqtSignal(dict, str)
 
 
+import time
+
 class _CaptureWorker(QRunnable):
     def __init__(
         self,
+        controller: TurntableController,
         save_dir: Path,
         count: int,
-        step_deg: float,
+        # step_deg: float,
         camera_index: int = 0,
         arduino=None,
     ) -> None:
         super().__init__()
+        self.controller = controller
         self.save_dir = save_dir
         self.count = count
-        self.step_deg = step_deg
+        # self.step_deg = step_deg
         self.camera_index = camera_index
         self.arduino = arduino
         self.signals = _CaptureSignals()
 
-    def run(self) -> None:  # type: ignore[override]
+    def run(self) -> None:  # type: ignore[override]        
+        self.controller.rotate_degrees(180.0)
+        time.sleep(1)
+        self.controller.home()
+        time.sleep(5)
+        
+        degrees_per_step = 180 / self.count
+        
+        
+        
         for i in range(self.count):
             filename = f"capture_{i:03d}.jpg"
             target = self.save_dir / filename
@@ -122,10 +135,14 @@ class _CaptureWorker(QRunnable):
                     target,
                     camera_index=self.camera_index,
                     arduino=self.arduino,
-                    advance_degrees=self.step_deg,
+                    # advance_degrees=self.step_deg,
                 )
                 info["index"] = i
                 self.signals.finished.emit(info, "")
+                time.sleep(1)
+                self.controller.rotate_degrees(degrees_per_step)
+                time.sleep(5)
+                
             except Exception as exc:  # pragma: no cover - environment dependent
                 logging.exception("Capture failed at index %d", i)
                 self.signals.finished.emit({}, str(exc))
@@ -487,6 +504,7 @@ class MainWindow(QMainWindow):
 
             self._log("Turntable connected.")
             self._update_turntable_ui("Turntable connected. Ready for capture sequence.")
+            self._run_turntable_self_test(controller)
         else:
             self._log("Disconnecting turntable...")
             try:
@@ -494,6 +512,98 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._update_turntable_ui("Turntable disconnected.")
+
+    def _run_turntable_self_test(self, controller: TurntableController) -> None:
+        if not controller.is_connected:
+            return
+
+        while True:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("Turntable self-test")
+            box.setText(
+                "Arduino connected. Choose how to proceed before capturing.\n"
+                "The motor only moves between 0° and 180°."
+            )
+            test_btn = box.addButton("Run ±90° test", QMessageBox.AcceptRole)
+            zero_btn = box.addButton("Move to 0°", QMessageBox.ActionRole)
+            max_btn = box.addButton("Move to 180°", QMessageBox.ActionRole)
+            skip_btn = box.addButton("Skip", QMessageBox.RejectRole)
+            box.exec_()
+            choice = box.clickedButton()
+
+            if choice == zero_btn:
+                if not self._move_turntable_to_zero(controller):
+                    return
+                self._log("Turntable moved to 0°.")
+                continue
+            if choice == max_btn:
+                if not self._move_turntable_to_max(controller):
+                    return
+                self._log("Turntable moved to 180°.")
+                continue
+            if choice == test_btn:
+                if not self._move_turntable_to_zero(controller):
+                    return
+                if not self._move_and_confirm(controller, 90.0, "Did the platform move forward by 90°?"):
+                    return
+                self._move_and_confirm(controller, -90.0, "Did the platform move back by 90°?")
+                return
+            self._log("Turntable self-test skipped by user.")
+            return
+
+    def _move_turntable_to_zero(self, controller: TurntableController) -> bool:
+        try:
+            controller.home()
+            return True
+        except TurntableError as exc:
+            self._handle_failed_turntable_test(controller, f"Unable to move to 0°: {exc}")
+            return False
+
+    def _move_turntable_to_max(self, controller: TurntableController) -> bool:
+        try:
+            controller.rotate_degrees(180.0)
+            return True
+        except TurntableError as exc:
+            self._handle_failed_turntable_test(controller, f"Unable to move to 180°: {exc}")
+            return False
+
+    def _move_and_confirm(self, controller: TurntableController, degrees: float, question: str) -> bool:
+        try:
+            controller.rotate_degrees(degrees)
+        except TurntableError as exc:
+            self._handle_failed_turntable_test(controller, f"Error while moving {degrees}°: {exc}")
+            return False
+
+        response = QMessageBox.question(
+            self,
+            "Movement check",
+            question,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if response != QMessageBox.Yes:
+            self._handle_failed_turntable_test(
+                controller,
+                "Movement not confirmed by the user. I tried to return the platform to 0°.",
+            )
+            return False
+        return True
+
+    def _handle_failed_turntable_test(self, controller: TurntableController, reason: str) -> None:
+        self._log(f"Turntable self-test failed: {reason}")
+        try:
+            controller.home()
+            self._log("Turntable homed at 0° after failed test.")
+        except TurntableError as exc:
+            self._log(f"Unable to home turntable: {exc}")
+
+        QMessageBox.warning(
+            self,
+            "Turntable test failed",
+            f"{reason}\nI tried to return the platform to 0°.\n"
+            "Remember: the motor only works between 0° and 180°.",
+        )
 
     def _refresh_turntable_availability(self) -> None:
         try:
@@ -505,6 +615,17 @@ class MainWindow(QMainWindow):
             return
 
         self.turntable = controller
+        ports = []
+        try:
+            ports = controller.list_available_ports()
+        except Exception:
+            pass
+        if ports:
+            ports_display = ", ".join(ports)
+            self._log(f"Serial ports detected: {ports_display}")
+        else:
+            self._log("No serial ports detected.")
+        self._log("Set ECLAIR_TURNTABLE_PORT to force a port if auto-detection fails.")
         if controller.is_available:
             self._log("Arduino turntable detected. Use 'Connect Turntable' to enable rotation.")
             self._update_turntable_ui()
@@ -639,7 +760,7 @@ class MainWindow(QMainWindow):
                 save_path,
                 camera_index=int(self.camera_index),
                 arduino=controller,
-                advance_degrees=advance,
+                # advance_degrees=advance,
                 capture=self.camera_capture,
             )
         except Exception as exc:  # pragma: no cover - hardware dependent
@@ -676,29 +797,30 @@ class MainWindow(QMainWindow):
             self._update_turntable_ui()
             return
 
-        if self.camera_index is None and not self._select_camera():
-            return
+        # if self.camera_index is None and not self._select_camera():
+        #     return
 
         count, ok = QInputDialog.getInt(
             self,
             "Capture count",
             "Number of photos to capture:",
-            value=12,
+            value=9,
             min=1,
-            max=360,
+            max=18,
         )
         if not ok:
             return
-        step_deg, ok2 = QInputDialog.getInt(
-            self,
-            "Step degrees",
-            "Degrees to step between captures:",
-            value=10,
-            min=1,
-            max=360,
-        )
-        if not ok2:
-            return
+        
+        # step_deg, ok2 = QInputDialog.getInt(
+        #     self,
+        #     "Step degrees",
+        #     "Degrees to step between captures:",
+        #     value=10,
+        #     min=1,
+        #     max=360,
+        # )
+        # if not ok2:
+        #     return
 
         project_dir = WORKSPACE_DIR / self._suggest_project_name()
         input_dir = project_dir / "input"
@@ -706,17 +828,19 @@ class MainWindow(QMainWindow):
         input_dir.mkdir(exist_ok=True)
 
         worker = _CaptureWorker(
+            controller=self.turntable,
             save_dir=input_dir,
             count=count,
-            step_deg=float(step_deg),
+            # step_deg=float(step_deg),
             camera_index=int(self.camera_index) if self.camera_index is not None else 0,
             arduino=self.turntable,
         )
-        self.capture_step_degrees = float(step_deg)
+        # self.capture_step_degrees = float(step_deg)
         worker.signals.finished.connect(self._on_capture_finished)
         self.thread_pool.start(worker)
         self._log(
-            f"Started capture sequence: {count} images, {step_deg}° step. Saving to {input_dir}"
+            # f"Started capture sequence: {count} images, {step_deg}° step. Saving to {input_dir}"
+            f"Started capture sequence: {count} images. Saving to {input_dir}"
         )
         self._log(f"Project folder prepared at {project_dir}")
 

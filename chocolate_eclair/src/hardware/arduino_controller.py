@@ -46,7 +46,7 @@ def send_Message(message):
 #Andreis methods
 def goback(x=1):
     global pos
-    target = pos - (x * 20)  # move back by x * 20 degrees
+    target = pos - x
     if target < 0:
         target = 0  # limit to minimum position
     for angle in range(pos, target - 1, -20):  # smooth steps backward
@@ -55,7 +55,7 @@ def goback(x=1):
         time.sleep(0.05)
 def goforward(x=1):
     global pos
-    target = pos + (x * 20)  # move forward by 20 degrees
+    target = pos + x
     if target > 180:
         target = 180  # limit to max position
     for angle in range(pos, target + 1, 20):  # smooth steps of 2 degrees

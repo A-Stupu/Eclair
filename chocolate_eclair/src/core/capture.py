@@ -6,10 +6,13 @@ from a background thread.
 """
 from __future__ import annotations
 
+# from spectacle_camera_screenshotter_2 import take_screenshot_flameshot
 import logging
 import sys
 from pathlib import Path
 from typing import Dict, Optional
+
+
 
 import cv2
 
@@ -50,33 +53,91 @@ def _open_camera(index: int = 0) -> cv2.VideoCapture:
     return cap
 
 
+
+
+
+
+
+
+
+
+
+
+
+import subprocess as s
+from os.path import exists
+# from time import sleep as t_sleep
+
+SFX_TIMER_WAIT = "./sounds/completion-partial.wav"
+SFX_TIMER_GO = "./sounds/completion-success.wav"
+SFX_SCREENSHOT = "./sounds/completion-rotation.wav"
+SFX_UNUSED = "./sounds/completion-fail.wav"
+SFX_END = "./sounds/message-new-instant.wav"
+
+stop_flag = False
+play_sfx = True
+
+def play(sfx:str) -> None:
+    if not play_sfx or not exists(sfx):
+        return
+
+    s.run(f"aplay {sfx}", shell=True, stdout=s.DEVNULL, stderr=s.DEVNULL)
+    return
+
+def take_screenshot_flameshot(output_file: str) -> None:
+    command = [
+        "flameshot",
+        "full",
+        "--path", output_file
+    ]
+
+    try:
+        s.run(command, check=True, stdout=s.DEVNULL, stderr=s.DEVNULL)
+        print(f"Screenshot saved to: {output_file}")
+        play(SFX_SCREENSHOT)
+    except s.CalledProcessError as e:
+        print(f"Error capturing screenshot: {e}")
+    return
+
+
+
+
+
+
+
+
 def capture_image(
     save_path: Path,
     camera_index: int = 0,
     capture: Optional[cv2.VideoCapture] = None,
 ) -> Path:
-    """Capture a single frame from the camera and write to save_path.
+    
+    # """Capture a single frame from the camera and write to save_path.
 
-    Returns the path to the saved file.
-    """
-    if capture is None:
-        cap = _open_camera(camera_index)
-        release_needed = True
-    else:
-        cap = capture
-        release_needed = False
+    # Returns the path to the saved file.
+    # """
+    # if capture is None:
+    #     cap = _open_camera(camera_index)
+    #     release_needed = True
+    # else:
+    #     cap = capture
+    #     release_needed = False
 
-    try:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            raise RuntimeError("Failed to capture frame from camera")
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(save_path), frame)
-        LOG.info("Captured image: %s", save_path)
-        return save_path
-    finally:
-        if release_needed:
-            cap.release()
+    # try:
+    #     ret, frame = cap.read()
+    #     if not ret or frame is None:
+    #         raise RuntimeError("Failed to capture frame from camera")
+    #     save_path.parent.mkdir(parents=True, exist_ok=True)
+    #     cv2.imwrite(str(save_path), frame)
+    #     LOG.info("Captured image: %s", save_path)
+    #     return save_path
+    # finally:
+    #     if release_needed:
+    #         cap.release()
+    
+    take_screenshot_flameshot(str(save_path))
+    LOG.info("Captured image via Flameshot: %s", save_path)
+    return save_path
 
 
 def capture_and_analyze(

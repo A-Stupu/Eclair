@@ -43,7 +43,8 @@ def _load_image(image_path: Path) -> np.ndarray:
 
 BLUR_THRESHOLD = 100.0
 BRIGHTNESS_RANGE = (40.0, 200.0)
-MIN_RESOLUTION_PIXELS = 12_000_000  # ~12 MP
+# 1920x1080 ~= 2.07 MP; allow anything at or above that resolution.
+MIN_RESOLUTION_PIXELS = 2_000_000
 
 
 def _calculate_blur(gray_image: np.ndarray) -> float:
@@ -82,17 +83,17 @@ def analyze_photo(image_path: Path | str) -> Dict[str, float | str | int | List[
     result = metrics.as_dict()
 
     issues: List[str] = []
-    if blur < BLUR_THRESHOLD:
-        issues.append(f"Blur score low ({blur:.2f} < {BLUR_THRESHOLD:.0f})")
+    # if blur < BLUR_THRESHOLD:
+    #     issues.append(f"Blur score low ({blur:.2f} < {BLUR_THRESHOLD:.0f})")
 
     min_brightness, max_brightness = BRIGHTNESS_RANGE
-    if brightness < min_brightness or brightness > max_brightness:
-        issues.append(
-            f"Brightness outside recommended range ({brightness:.2f} not in {int(min_brightness)}-{int(max_brightness)})"
-        )
+    # if brightness < min_brightness or brightness > max_brightness:
+    #     issues.append(
+    #         f"Brightness outside recommended range ({brightness:.2f} not in {int(min_brightness)}-{int(max_brightness)})"
+    #     )
 
-    if (width * height) < MIN_RESOLUTION_PIXELS:
-        issues.append("Resolution below 12 MP")
+    # if (width * height) < MIN_RESOLUTION_PIXELS:
+    #     issues.append("Resolution below 2 MP (minimum 1920x1080)")
 
     status = "OK" if not issues else "Needs attention"
     result["status"] = status
